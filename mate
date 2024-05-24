@@ -37,7 +37,7 @@ FZF_DEFAULT_OPTS="
 "
 # --inline-info
 
-function switch_or_attach() {
+function goto_or_kill_session() {
     FZF_TMUX_OPTIONS="
         --border-label='Tmux Sessions'
         --multi
@@ -255,7 +255,7 @@ case "${arg}" in
         exit 0
         ;;
     "-t")
-        switch_or_attach
+        goto_or_kill_session
         exit 0
         ;;
 esac
