@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+
+# Script Overview
+#
+# This Bash script provides functionality to manage Tmux sessions interactively
+# using FZF (Fuzzy Finder).
+#
+# Usage
+#
+# The script can be executed with the following command line options:
+#
+# - `-a`: Create a new Tmux session based on the selected directory using `fd`
+#   (alternative to `find`) and `fzf-tmux`.
+# - `-n`: Create a new Tmux session based on the selected directory using
+#   `zoxide` and `fzf-tmux`.
+# - `-t`: Switch or attach to an existing Tmux session.
+#
+# Dependencies
+#
+# - Tmux: Terminal multiplexer.
+# - FZF: Fuzzy Finder for command-line.
+# - fd: Alternative to `find` command, used for directory selection.
+# - zoxide: A smarter `cd` command that tracks your most used directories.
+#
+# Functionality
+#
+# Creating a New Tmux Session
+#
+# When using the `-a` or `-n` option, the script allows the user to select a
+# directory interactively using FZF. It then creates a new Tmux session based on
+# the selected directory, appending a timestamp to
+
+
+FZF_DEFAULT_OPTS="
+--height 50% -1 
+--reverse
+"
+# --inline-info
+
+function switch_or_attach() {
+    FZF_TMUX_OPTIONS="
+        --border-label='Tmux Sessions'
+        --multi
+        --exit-0
+        --expect=ctrl-alt-k,ctrl-r,enter
+        --header='enter=switch, C-M-k=kill, C-r=rename'
+        --preview='tmux_pane_preview {} | bat --style plain'
+        --preview-window='down,70%,border-rounded'
+    "
+
+    # Store current session window pane
+    curr_session_window_pane=$(tmux display-message -p '#{session_name}:#{window_id}.#{pane_id}')
+
+    # Get the names of all sessions
+    sessions_list=$(tmux list-sessions -F '#{session_name}')
+
+    # This variable stores the list of all available windows and panes from all sessions
+    # except the current one. Each entry in the string follows the format:
+    # <session name>:<window index>.<pane index>\n
+    # For example:
+    # foo/sub-foo:1.1
+    # bar/sub-bar1:1.1
+    # bar/sub-bar1:1.2
+    # 
+    # NOTE: I used #{window_index} and #{pane_index} instead of their IDs as it is more 
+    # user-readable.
+    # However, this brings some complications to kill-pane, which requires preprocessing before 
+    # killing the panes: I need to convert the window and pane indexes to their respective IDs 
+    # as the indexes of the panes are rearranged after a pane is killed.
+    # For example, let's consider that we have these three panes:
+    #   Pane ID #1: foo:1.1
+    #   Pane ID #2: foo:1.2
+    #   Pane ID #3: foo:1.3
+    # After killing pane 1, the index of the remaining panes is rearranged so that we will have:
+    #   Pane ID #2: foo:1.1
+    #   Pane ID #3: foo:1.2
+    # The ID is immutable; hence, we have to use it to kill the panes and not the index.
+    final_list=""
+
+    # Iterate through each session
+    for session_name in $sessions_list; do
+        # Retrieve windows for the current session
+        session_windows=$(tmux list-windows -F '#{window_index}' -t "$session_name")
+
+        # Iterate through each window in the session to get the list of panes
+        for window_idx in $session_windows; do
+            to_append=$(tmux list-panes \
+                -F "#{session_name}:#{window_index}.#{pane_index}" \
+                -t "${session_name}:${window_idx}")
+            if [[ -n ${to_append} ]]; then
+                final_list+=${to_append}
+                final_list+="\n"
+            fi
+        done
+    done
+
+    zoomed=$(tmux display-message -p '#{window_zoomed_flag}')
+    if [ "$zoomed" == "0" ]; then
+        # zoom the pane when it is not zoomed
+        tmux resize-pane -Z
+    fi
+
+    # Run FZF with final_list
+    selected_items=$(echo -ne "${final_list}" \
+        | FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${FZF_TMUX_OPTIONS}" fzf-tmux -r)
+
+    # Restore pane zoom state if necessary
+    if [ "$zoomed" == "0" ]; then
+        tmux resize-pane -Z
+    fi
+
+    # Handle selected action
+    if [[ -n "$selected_items" ]]; then
+        key=$(head -1 <<< "$selected_items")
+        mapfile -t sessions <<< "$(tail -n+2 <<< "$selected_items")"
+
+        case "$key" in
+            ctrl-alt-k)
+                to_process=()
+                trying_to_kill_curr_pane=false
+                for s in "${sessions[@]}"; do
+                    # ${s/.*} removes all chars AFTER the first '.' (dot)
+                    session_name_and_window_index="${s/.*}"
+                    # ${s/*.} removes all chars BEFORE the first '.' (dot)
+                    pane_idx="${s/*.}"
+                    tmp_val=$(tmux list-panes \
+                        -F "#{session_name}:#{window_id}.#{pane_id}" \
+                        -f "#{==:#{pane_index},${pane_idx}}" \
+                        -t "$session_name_and_window_index")
+
+                    if [ "${tmp_val}" = "${curr_session_window_pane}" ] ; then
+                        # skip adding tmp_val to to_process list as it will be appended to the end of the list
+                        trying_to_kill_curr_pane=true
+                    else
+                        to_process+=("$tmp_val")
+                    fi
+                done
+                if [ "${trying_to_kill_curr_pane}" = true ] ; then
+                    # killing the current active pane as the last in the list unsures that all panes will be 
+                    # correctly killed. 
+                    to_process+=("${curr_session_window_pane}")
+                fi
+                # Kill selected panes
+                for to_kill in "${to_process[@]}"; do
+                    tmux kill-pane -t "$to_kill"
+                done
+                ;;
+            ctrl-r)
+                declare -A to_process
+                for s in "${sessions[@]}"; do
+                    # ${s/:*} removes all chars AFTER the first ':' (colon)
+                    session_name="${s/:*}"
+                    # this is a way to remove duplicated values from $sessions array
+                    to_process["${session_name}"]=${session_name}
+                done
+                for to_rename in "${to_process[@]}"; do
+                    read -r -p "Rename tmux session '$to_rename' to: " new_session_name
+                    tmux rename-session -t "$to_rename" "${new_session_name}"
+                done
+                ;;
+            enter)
+                # Switch or attach to the selected session:window_index.pane_index
+                [[ -n "$TMUX" ]] && change="switch-client" || change="attach-session"
+                goto_session "${sessions[0]}"
+                ;;
+        esac
+    fi
+}
+
+function goto_session() {
+    [[ -n "$TMUX" ]] && change="switch-client" || change="attach-session"
+    tmux "${change}" -t "$1"
+}
+
+function create_new_session_and_switch_to() {
+    target_dir=$1
+    
+    # session names can't contain either `.` or `:` so let's replace them with `_`
+    session_name="${target_dir/[.:]/_}-$(date +"%m%d_%H%M%S")"
+    # echo "target_dir: $1"
+    # echo "session_name: ${session_name}"
+    tmux new-session -s "${session_name}" -d -c "${target_dir}"
+    [[ -n "$TMUX" ]] && change="switch-client" || change="attach-session"
+    goto_session "${session_name}"
+}
+
+arg="$1"
+
+if [ -z "${arg}" ]; then
+    arg="-o"
+fi
+
+case "${arg}" in
+    "-o")
+        selected_dir=$(zoxide query -l | sed "s|${HOME}/||" | LC_ALL=C sort -f)
+        selected_dir=$(echo -e "~\n${selected_dir}" \
+            | FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${FZF_TMUX_OPTIONS}" fzf-tmux -r)
+
+        if [[ -z "${selected_dir}" ]]; then
+            exit 1
+        fi
+
+        create_new_session_and_switch_to "${selected_dir}"
+        exit 0
+        ;;
+    "-n")
+        selected_dir=$( \
+            fd . \
+            --type d \
+            -H \
+            --ignore-file "${HOME}/.gitignore" \
+            --exclude .git \
+            --base-directory \
+            "${HOME}" \
+            | LC_ALL=C sort -f)
+        selected_dir=$(echo -e "~\n${selected_dir}" \
+            | FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${FZF_TMUX_OPTIONS}" fzf-tmux -r)
+
+        if [[ -z "${selected_dir}" ]]; then
+            exit 1
+        fi
+
+        create_new_session_and_switch_to "${selected_dir}"
+        exit 0
+        ;;
+    "-t")
+        switch_or_attach
+        exit 0
+        ;;
+esac
+
+exit 1
