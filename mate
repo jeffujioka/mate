@@ -333,6 +333,15 @@ fi
 
 case "${arg}" in
 kickoff)
+    # create a new session and switch to it if the 2nd arg is a directory 
+    # usage: mate kickoff /create/new/session/and/switch/to/it
+    if [ $# -eq 2 ] && [ -d "$2" ]; then
+        cddir="$2"
+        session_name=$(generate_new_session_name "$cddir")
+        create_new_session_and_switch_to "$session_name" "$cddir"
+        exit 0
+    fi
+
     base_dir="$HOME"
     use_zoxide=true
     shift
