@@ -5,16 +5,6 @@
 # This Bash script provides functionality to manage Tmux sessions interactively
 # using FZF (Fuzzy Finder).
 #
-# Usage
-#
-# The script can be executed with the following command line options:
-#
-# - `-a`: Create a new Tmux session based on the selected directory using `fd`
-#   (alternative to `find`) and `fzf-tmux`.
-# - `-n`: Create a new Tmux session based on the selected directory using
-#   `zoxide` and `fzf-tmux`.
-# - `-t`: Switch or attach to an existing Tmux session.
-#
 # Dependencies
 #
 # - Tmux: Terminal multiplexer.
@@ -22,13 +12,6 @@
 # - fd: Alternative to `find` command, used for directory selection.
 # - zoxide: A smarter `cd` command that tracks your most used directories.
 #
-# Functionality
-#
-# Creating a New Tmux Session
-#
-# When using the `-a` or `-n` option, the script allows the user to select a
-# directory interactively using FZF. It then creates a new Tmux session based on
-# the selected directory, appending a timestamp to
 
 FZF_DEFAULT_OPTS="
 --height 50% -1 
@@ -325,15 +308,42 @@ function manage_sessions() {
     esac
 }
 
-arg="$1"
+function display_help() {
+    echo "Usage: mate [COMMAND] [OPTIONS]"
+    echo "Manage Tmux sessions interactively using FZF."
+    echo ""
+    echo "Commands:"
+    echo "  kickoff              Create a new Tmux session and switch/attach to it."
+    echo "  manage               Manage existing Tmux sessions: switch/attach, rename, or kill."
+    echo ""
+    echo "Options for kickoff:"
+    echo "  --no-zoxide          Use 'fd' for directory selection instead of 'zoxide'."
+    echo "                       This option is ignored if a directory path is provided."
+    echo "  --base-dir <path>    Specify the root directory for fd to find folders."
+    echo "                       Defaults to \$HOME if not specified."
+    echo "                       This option is ignored if a directory path is provided."
+    echo "  -h, --help           Display this help and exit."
+    echo ""
+    echo "Examples:"
+    echo "  mate kickoff                          # Start a new session with zoxide"
+    echo "  mate kickoff /path/to/directory       # Start a new session using the specified directory"
+    echo "  mate kickoff --no-zoxide              # Start a new session using 'fd' for directory selection"
+    echo "  mate kickoff --base-dir /any/path     # Start a new session with 'fd' in the specified root directory"
+    echo "  mate manage                           # Manage existing Tmux sessions"
+}
 
-if [ -z "${arg}" ]; then
-    arg="kickoff"
+# --------------------------------------------------------------------------------------------------
+#
+
+if [ -z "$1" ] || [[ "$1" == "--help" ]]; then
+    display_help
+    exit 1
 fi
 
+arg="$1"
 case "${arg}" in
 kickoff)
-    # create a new session and switch to it if the 2nd arg is a directory 
+    # create a new session and switch to it if the 2nd arg is a directory
     # usage: mate kickoff /create/new/session/and/switch/to/it
     if [ $# -eq 2 ] && [ -d "$2" ]; then
         cddir="$2"
