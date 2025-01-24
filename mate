@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+
+# Script Overview
+#
+# This Bash script provides functionality to manage Tmux sessions interactively
+# using FZF (Fuzzy Finder).
+#
+# Dependencies
+#
+# - Tmux: Terminal multiplexer.
+# - FZF: Fuzzy Finder for command-line.
+# - fd: Alternative to `find` command, used for directory selection.
+# - zoxide: A smarter `cd` command that tracks your most used directories.
+#
+
+FZF_DEFAULT_OPTS="
+--height 50% -1 
+--reverse
+"
+
+function list_all_sessions_windows_panes() {
+    # Get the names of all sessions
+    # local sessions_list=$(tmux list-sessions -F '#{session_name}')
+
+    local to_return_list=""
+
+    while read -r session_name; do
+
+        # This variable stores the list of all available windows and panes from all sessions
+        # except the current one. Each entry in the string follows the format:
+        # <session name>:<window index>.<pane index>\n
+        # For example:
+        # foo/sub-foo:1.1
+        # bar/sub-bar1:1.1
+        # bar/sub-bar1:1.2
+        #
+        # NOTE: I used #{window_index} and #{pane_index} instead of their IDs as it is more
+        # user-readable.
+        # However, this brings some complications to kill-pane, which requires preprocessing before
+        # killing the panes: I need to convert the window and pane indexes to their respective IDs
+        # as the indexes of the panes are rearranged after a pane is killed.
+        # For example, let's consider that we have these three panes:
+        #   Pane ID #1: foo:1.1
+        #   Pane ID #2: foo:1.2
+        #   Pane ID #3: foo:1.3
+        # After killing pane 1, the index of the remaining panes is rearranged so that we will have:
+        #   Pane ID #2: foo:1.1
+        #   Pane ID #3: foo:1.2
+        # The ID is immutable; hence, we have to use it to kill the panes and not the index.
+        session_windows=$(tmux list-windows -F '#{window_index}' -t "$session_name")
+
+        # Iterate through each window in the session to get the list of panes
+        for window_idx in $session_windows; do
+            to_append=$(tmux list-panes \
+                -F "#{session_name}:#{window_index}.#{pane_index}" \
+                -t "${session_name}:${window_idx}")
+            if [[ -n ${to_append} ]]; then
+                to_return_list+=${to_append}
+                to_return_list+="\n"
+            fi
+        done
+    done < <(tmux list-sessions -F '#{session_name}')
+
+    echo "$to_return_list"
+}
+
+# Function to find the highest sequence number of tmux sessions matching the search name pattern
+#
+# The steps are as follows:
+# 1. List all active tmux sessions.
+# 2. Filter sessions that begins with "search name"
+# 3. Remove everything up to (and including) 'S' from the session name
+# 4. Sort the sequence numbers in reverse numerical order to get the highest suffix.
+# 5. Select the first (highest) sequence number using `head`.
+function find_max_session_sequence() {
+    local search_name="$1"
+    tmux list-sessions | grep -E "^$search_name - " | sed 's|.* - S||' | sort -nr | head -n 1
+}
+
+function format_new_session_name() {
+    local session_name=$1
+    local sequence=$2
+    local formatted_sequence=$(printf "%02d" "$sequence")
+    echo "${session_name} - S${formatted_sequence}"
+}
+
+function generate_first_name() {
+    local name="$1"
+    echo "${name} - S01"
+}
+
+function generate_new_session_name() {
+    # Sanitizes the search name by replacing dots and colons with underscores.
+    local search_name="${1/[.:]/_}"
+
+    if [[ -z "$TMUX" ]]; then
+        # tmux isn't running that means no active session so let's create the 1st one "manually"
+        generate_first_name "$search_name"
+        return 0
+    fi
+
+    local highest_seq=$(find_max_session_sequence "$search_name")
+
+    if [[ -z $highest_seq ]]; then
+        # there is no matching session, so let's create the 1st one
+        generate_first_name "$search_name"
+        return 0
+    fi
+
+    # removes the leading zero
+    local non_padded_seq=$(printf "%d" "$highest_seq")
+    local next_seq=$((non_padded_seq + 1))
+
+    local new_session_name=$(format_new_session_name "$search_name" "$next_seq")
+    echo "$new_session_name"
+}
+
+function create_new_session_and_switch_to() {
+    session_name=$1
+    base_dir=$2
+
+    tmux new-session -s "${session_name}" -d -c "${base_dir}"
+    goto_session "${session_name}"
+}
+
+function display_funny_cancelation_msg() {
+    local messages=(
+        "Okay, boss! Operation canceled as per your command. 🛑"
+        "Your wish is my command. Mission canceled! 🚫"
+        "No problem! Operation canceled upon request. 😎"
+        "Roger that! Cancelation complete. Over and out! 📞"
+        "You got it! Operation canceled just for you. 👍"
+        "Alrighty! Task canceled as requested. 😁"
+        "Cancelation confirmed! Mission aborted. 👨‍✈️"
+        "Done and done! Operation canceled on your orders. 📝"
+        "Aye aye, captain! Operation canceled. 🚢"
+        "Consider it done! Operation canceled as you asked. 🤝"
+    )
+    random_message=${messages[RANDOM % ${#messages[@]}]}
+    echo "${random_message}"
+    exit 1
+}
+
+function validate_dir() {
+    local base_dir=$1
+    local relative_dir=$2
+
+    local target_dir="${base_dir}${relative_dir}"
+
+    if [[ $relative_dir = "~" ]]; then
+        target_dir="$HOME"
+    fi
+
+    if [[ -z "${relative_dir}" ]]; then
+        display_funny_cancelation_msg
+    fi
+
+    target_dir="${target_dir/#~/"$HOME"/}"
+
+    if [ ! -d "${target_dir}" ]; then
+        echo "Uh-oh, looks like the directory '${target_dir}' doesn't exist... that's not supposed to happen. Aborted! 🤷‍♂️"
+        exit 1
+    fi
+}
+
+function kill_sessions() {
+    local sessions_to_kill=("$@")
+    to_process=()
+    trying_to_kill_curr_pane=false
+    for s in "${sessions_to_kill[@]}"; do
+        # ${s/.*} removes all chars AFTER the first '.' (dot)
+        session_name_and_window_index="${s/.*/}"
+        # ${s/*.} removes all chars BEFORE the first '.' (dot)
+        pane_idx="${s/*./}"
+        tmp_val=$(tmux list-panes \
+            -F "#{session_name}:#{window_id}.#{pane_id}" \
+            -f "#{==:#{pane_index},${pane_idx}}" \
+            -t "$session_name_and_window_index")
+
+        if [ "${tmp_val}" = "${curr_session_window_pane}" ]; then
+            # skip adding tmp_val to to_process list as it will be appended to the end of the list
+            trying_to_kill_curr_pane=true
+        else
+            to_process+=("$tmp_val")
+        fi
+    done
+    if [ "${trying_to_kill_curr_pane}" = true ]; then
+        # killing the current active pane as the last in the list unsures that all panes will be
+        # correctly killed.
+        to_process+=("${curr_session_window_pane}")
+    fi
+    # Kill selected panes
+    for to_kill in "${to_process[@]}"; do
+        tmux kill-pane -t "$to_kill"
+    done
+}
+
+function rename_sessions() {
+    local sessions_to_rename=("$@")
+    declare -A to_process
+
+    for s in "${sessions_to_rename[@]}"; do
+        # ${s/:*} removes all chars AFTER the first ':' (colon)
+        session_name="${s/:*/}"
+        # this is a way to remove duplicated values from $sessions array
+        to_process["${session_name}"]=${session_name}
+    done
+
+    for to_rename in "${to_process[@]}"; do
+        read -rp "Rename tmux session to: " new_session_name
+        tmux rename-session -t "$to_rename" "${new_session_name}"
+    done
+}
+
+function goto_session() {
+    [[ -n "$TMUX" ]] && cmd="switch-client" || cmd="attach-session"
+    tmux "${cmd}" -t "$1"
+}
+
+function kickoff_new_session() {
+    local use_zoxide=$1
+    local root_dir=$2
+
+    local session_name=""
+
+    # local base_dir
+    if $use_zoxide; then
+        selected_dir=$(zoxide query -l | sed "s|${HOME}/||" | LC_ALL=C sort -f)
+        selected_dir=$(echo -e "~\n${selected_dir}" |
+            FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${FZF_TMUX_OPTIONS}" fzf-tmux -p50%,75%)
+
+        validate_dir "${HOME}/" "${selected_dir}"
+        session_name=$(generate_new_session_name "$selected_dir")
+
+        create_new_session_and_switch_to "$session_name" "$HOME/$selected_dir"
+    else
+        selected_dir=$(
+            fd . \
+                --type d \
+                -H \
+                --ignore-file "${HOME}/.gitignore" \
+                --exclude .git \
+                "$root_dir" |
+                LC_ALL=C sort -f |
+                sed "s|$HOME|~|"
+        )
+        selected_dir=$(echo -e "~\n${selected_dir}" |
+            FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${FZF_TMUX_OPTIONS}" fzf-tmux -p30%,50%)
+
+        validate_dir "" "${selected_dir}"
+        create_new_session_and_switch_to "" "${selected_dir}"
+
+    fi
+
+}
+
+function manage_sessions() {
+    FZF_TMUX_OPTIONS="
+        --border-label='Tmux Sessions'
+        --multi
+        --exit-0
+        --expect=ctrl-alt-k,ctrl-r,enter
+        --header='enter=switch, C-M-k=kill, C-r=rename'
+        --preview='tmux_pane_preview {} | bat --style plain'
+        --preview-window='down,70%,border-rounded'
+    "
+
+    zoomed=$(tmux display-message -p '#{window_zoomed_flag}')
+    if [ "$zoomed" == "0" ]; then
+        # zoom the pane when it is not zoomed
+        tmux resize-pane -Z
+    fi
+
+    session_windows_panes_list=$(list_all_sessions_windows_panes)
+    selected_items=$(echo -ne "${session_windows_panes_list}" |
+        FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} ${FZF_TMUX_OPTIONS}" fzf-tmux -p75%,95%)
+
+    if [[ -z "${selected_items}" ]]; then
+        display_funny_cancelation_msg
+    fi
+
+    # Restore pane zoom state if necessary
+    if [ "$zoomed" == "0" ]; then
+        tmux resize-pane -Z
+    fi
+
+    # Handle selected action
+    key=$(head -1 <<<"$selected_items")
+    mapfile -t sessions <<<"$(tail -n+2 <<<"$selected_items")"
+
+    # Store current session window pane
+    curr_session_window_pane=$(tmux display-message -p '#{session_name}:#{window_id}.#{pane_id}')
+
+    case "$key" in
+    ctrl-alt-k)
+        kill_sessions "${sessions[@]}"
+        return
+        ;;
+    ctrl-r)
+        rename_sessions "${sessions[@]}"
+        return
+        ;;
+    enter)
+        # Switch or attach to the selected session:window_index.pane_index
+        goto_session "${sessions[0]}"
+        return
+        ;;
+    esac
+}
+
+function display_help() {
+    echo "Usage: mate [COMMAND] [OPTIONS]"
+    echo "Manage Tmux sessions interactively using FZF."
+    echo ""
+    echo "Commands:"
+    echo "  kickoff              Create a new Tmux session and switch/attach to it."
+    echo "  manage               Manage existing Tmux sessions: switch/attach, rename, or kill."
+    echo ""
+    echo "Options for kickoff:"
+    echo "  --no-zoxide          Use 'fd' for directory selection instead of 'zoxide'."
+    echo "                       This option is ignored if a directory path is provided."
+    echo "  --base-dir <path>    Specify the root directory for fd to find folders."
+    echo "                       Defaults to \$HOME if not specified."
+    echo "                       This option is ignored if a directory path is provided."
+    echo "  -h, --help           Display this help and exit."
+    echo ""
+    echo "Examples:"
+    echo "  mate kickoff                          # Start a new session with zoxide"
+    echo "  mate kickoff /path/to/directory       # Start a new session using the specified directory"
+    echo "  mate kickoff --no-zoxide              # Start a new session using 'fd' for directory selection"
+    echo "  mate kickoff --base-dir /any/path     # Start a new session with 'fd' in the specified root directory"
+    echo "  mate manage                           # Manage existing Tmux sessions"
+}
+
+# --------------------------------------------------------------------------------------------------
+#
+
+if [ -z "$1" ] || [[ "$1" == "--help" ]]; then
+    display_help
+    exit 1
+fi
+
+arg="$1"
+case "${arg}" in
+kickoff)
+    # create a new session and switch to it if the 2nd arg is a directory
+    # usage: mate kickoff /create/new/session/and/switch/to/it
+    if [ $# -eq 2 ] && [ -d "$2" ]; then
+        cddir="$2"
+        session_name=$(generate_new_session_name "$cddir")
+        create_new_session_and_switch_to "$session_name" "$cddir"
+        exit 0
+    fi
+
+    base_dir="$HOME"
+    use_zoxide=true
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        "--no-zoxide" | "-a")
+            use_zoxide=false
+            shift
+            ;;
+        "--base-dir")
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "missing a path to --base-dir"
+                exit 1
+            fi
+            base_dir="$1"
+            shift
+            ;;
+        *)
+            echo "invalid argument: $1"
+            shift
+            ;;
+        esac
+    done
+
+    kickoff_new_session $use_zoxide "$base_dir"
+    exit 0
+    ;;
+manage)
+    manage_sessions
+    exit 0
+    ;;
+*)
+    echo "Invalid option!"
+    exit 1
+    ;;
+esac
