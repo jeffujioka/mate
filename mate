@@ -91,7 +91,8 @@ function generate_first_name() {
 
 function generate_new_session_name() {
     # Sanitizes the search name by replacing dots and colons with underscores.
-    local search_name="${1/[.:]/_}"
+    local search_name=$(echo "$1" | sed 's/\./_/g')
+
 
     if [[ -z "$TMUX" ]]; then
         # tmux isn't running that means no active session so let's create the 1st one "manually"
@@ -107,11 +108,15 @@ function generate_new_session_name() {
         return 0
     fi
 
-    # removes the leading zero
-    local non_padded_seq=$(printf "%d" "$highest_seq")
-    local next_seq=$((non_padded_seq + 1))
+    # Extract only the first numeric part and remove leading zeros
+    local non_padded_seq=$(echo "$highest_seq" | sed -E 's/[^0-9]*([0-9]+).*/\1/' | sed 's/^0*//')
 
+    # If non_padded_seq is empty (e.g., "000"), set it to 0
+    [[ -z "$non_padded_seq" ]] && non_padded_seq=0
+
+    local next_seq=$((non_padded_seq + 1))
     local new_session_name=$(format_new_session_name "$search_name" "$next_seq")
+
     echo "$new_session_name"
 }
 
